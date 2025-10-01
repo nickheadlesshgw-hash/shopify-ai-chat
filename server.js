@@ -194,4 +194,5 @@ app.get("/chat-proxy-stream", async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log("AI Chat server ascolta su :3000"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`AI Chat server ascolta su :${PORT}`));
