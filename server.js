@@ -7,6 +7,7 @@ import { OpenAI } from "openai";
 
 const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true })); // serve per la form di test
 
 // Variabili d’ambiente (le imposterai su Render)
 const SHOP_DOMAIN = process.env.SHOP_DOMAIN; // es: myshop.myshopify.com
@@ -24,6 +25,10 @@ const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 function verifyProxySignature(/* query */) {
   return true;
 }
+
+// ---------------------
+// Helpers Shopify
+// ---------------------
 
 // Storefront API (prodotto per handle)
 async function storefrontGetProductByHandle(handle) {
@@ -71,7 +76,9 @@ async function adminGetOrderStatus(email, orderNumber) {
   return json.data?.orders?.edges?.[0]?.node || null;
 }
 
+// ---------------------
 // Chat con tools (OpenAI)
+// ---------------------
 async function chatWithTools(messages) {
   const tools = [
     {
@@ -105,6 +112,7 @@ async function chatWithTools(messages) {
     tools
   });
 
+  // Loop per gestire eventuali chiamate a tool
   while (true) {
     const toolCalls = resp?.output?.filter(o => o.type === "tool_call") || [];
     if (!toolCalls.length) break;
@@ -136,9 +144,10 @@ async function chatWithTools(messages) {
 }
 
 // ---------------------
-// Rotta POST per App Proxy (widget)
-// Impone: ITA + niente link esterni
+// Rotte
 // ---------------------
+
+// Rotta POST per App Proxy (widget)
 app.post("/chat-proxy", async (req, res) => {
   try {
     if (!verifyProxySignature(req.query)) {
@@ -153,47 +162,8 @@ app.post("/chat-proxy", async (req, res) => {
       { role: "user", content: userMsg }
     ];
     const answer = await chatWithTools(messages);
-    res.json({ answer });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
-// (Opzionale) GET streaming SSE - spesso l'App Proxy bufferizza: usalo solo se ti serve
-app.get("/chat-proxy-stream", async (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-
-  const user = req.query.q || "Ciao!";
-  const messages = [
-    { role: "system", content:
-      "Sei l'assistente AI del negozio. Rispondi SOLO in italiano. Non usare mai link esterni." },
-    { role: "user", content: String(user) }
-  ];
-
-  try {
-    const stream = await client.responses.stream({
-      model: "gpt-4.1-mini",
-      input: messages,
-    });
-
-    stream.on("message", (msg) => {
-      res.write(`data:${JSON.stringify(msg)}\n\n`);
-    });
-
-    stream.on("end", () => res.end());
-    stream.on("error", (e) => {
-      res.write(`event: error\ndata:${JSON.stringify({ error: e.message })}\n\n`);
-      res.end();
-    });
-  } catch (e) {
-    res.write(`event: error\ndata:${JSON.stringify({ error: e.message })}\n\n`);
-    res.end();
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.get("/", (req, res) => res.send("AI Chat up ✅"));
-app.listen(PORT, () => console.log(`AI Chat server ascolta su :${PORT}`));
+    // Sanitizza eventuali link esterni
+    function sanitizeLinks(text, shopDomain) {
+      if (!text) return text;
+      const allowed
