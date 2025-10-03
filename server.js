@@ -7,49 +7,52 @@ import { OpenAI } from "openai";
 
 const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true })); // per la form /test
+app.use(express.urlencoded({ extended: true })); // per form/test
 
 // ===== ENV =====
 const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/$/, ""); // es: https://shopify-ai-chat.onrender.com
-const SHOP_DOMAIN = process.env.SHOP_DOMAIN || ""; // opzionale default es: myshop.myshopify.com
+const SHOP_DOMAIN = process.env.SHOP_DOMAIN || ""; // default shop (facoltativo)
 const SF_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN || "";
-const ADMIN_TOKEN_FALLBACK = process.env.SHOPIFY_ADMIN_TOKEN || ""; // fallback solo se non usi OAuth
+const ADMIN_TOKEN_FALLBACK = process.env.SHOPIFY_ADMIN_TOKEN || ""; // fallback se non usi OAuth
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const SHOPIFY_APP_SECRET = process.env.SHOPIFY_APP_SECRET || ""; // (non usato nel prototipo App Proxy)
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || "";
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || "";
 const SHOPIFY_SCOPES = process.env.SHOPIFY_SCOPES || "read_products,read_orders,read_app_proxy,write_app_proxy";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // modello economico di default
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // modello economico
+
+if (!OPENAI_API_KEY) {
+  console.warn("[WARN] OPENAI_API_KEY mancante. /chat-proxy risponderà con errore.");
+}
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// In memoria: token Admin per shop (per prototipo; in produzione usa DB/secret manager)
+// In memoria: token Admin per shop (prototipo; in produzione usa DB/secret manager)
 const TOKENS = new Map(); // Map<shopDomain, admin_access_token>
 
 // ===== Utils =====
 
-// (FACOLTATIVO) Verifica firma App Proxy (qui bypass: true per prototipo)
+// (FACOLTATIVO) Verifica firma App Proxy (qui bypassata per prototipo)
 function verifyProxySignature(/* query */) { return true; }
 
 // Verifica shop *.myshopify.com
 function isValidShop(shop) { return typeof shop === "string" && /\.myshopify\.com$/.test(shop); }
 
-// Sanitize: blocca link esterni, consente relativi e dominio dello shop
+// Blocca link esterni, consente relativi e dominio dello shop
 function sanitizeLinks(text, shopDomain) {
   if (!text) return text;
   const allowedHost = (shopDomain || "").replace(/^https?:\/\//, "");
   return String(text)
-    // 1) markdown [label](url)
+    // markdown [label](url)
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, (m, label, url) => {
       return url.includes(allowedHost) ? m : `${label} ([link rimosso])`;
     })
-    // 2) url naked
+    // url in chiaro
     .replace(/https?:\/\/[^\s)]+/gi, (m) => (m.includes(allowedHost) ? m : "[link rimosso]"));
 }
 
 // ===== OAuth (Partner App) =====
 
-// Costruisce URL di autorizzazione
+// Costruisce URL autorizzazione
 function buildInstallUrl({ shop, state }) {
   const params = new URLSearchParams({
     client_id: SHOPIFY_CLIENT_ID,
@@ -60,13 +63,13 @@ function buildInstallUrl({ shop, state }) {
   return `https://${shop}/admin/oauth/authorize?${params.toString()}`;
 }
 
-// Verifica HMAC della query (callback OAuth)
+// Verifica HMAC callback
 function verifyHmacQuery(queryObj, secret) {
   const q = { ...queryObj };
   const hmac = q.hmac;
   if (!hmac) return false;
   delete q.hmac;
-  delete q.signature; // vecchio parametro
+  delete q.signature;
   const message = Object.keys(q)
     .sort()
     .map(k => `${k}=${Array.isArray(q[k]) ? q[k].join(",") : q[k]}`)
@@ -83,7 +86,7 @@ function verifyHmacQuery(queryObj, secret) {
 app.get("/auth/start", (req, res) => {
   const shop = String(req.query.shop || "").toLowerCase();
   if (!isValidShop(shop)) return res.status(400).send("Parametro 'shop' mancante o non valido");
-  const state = crypto.randomBytes(16).toString("hex"); // per demo; in prod salva/verifica
+  const state = crypto.randomBytes(16).toString("hex"); // in produzione: salva/verifica state
   res.redirect(buildInstallUrl({ shop, state }));
 });
 
@@ -106,7 +109,6 @@ app.get("/auth/callback", async (req, res) => {
     });
     const json = await r.json(); // { access_token, scope }
     if (!json.access_token) throw new Error("Nessun access_token nella risposta OAuth");
-
     TOKENS.set(shop, json.access_token);
     console.log(`[OAuth] Install OK for ${shop} — token: ${json.access_token.slice(0,6)}...`);
     res.send("Installazione completata ✅ Puoi chiudere questa pagina e usare l'App Proxy / le API.");
@@ -118,7 +120,7 @@ app.get("/auth/callback", async (req, res) => {
 
 // ===== Shopify helpers =====
 
-// Storefront API (prodotto per handle) — usa shop specifico se passato, altrimenti default
+// Storefront API (prodotto per handle)
 async function storefrontGetProductByHandle(handle, shopDomain = SHOP_DOMAIN, sfToken = SF_TOKEN) {
   const url = `https://${shopDomain}/api/2024-07/graphql.json`;
   const q = `
@@ -169,6 +171,10 @@ async function adminGetOrderStatus(email, orderNumber, shopDomain = SHOP_DOMAIN)
 
 // ===== OpenAI chat con tools =====
 async function chatWithTools(messages, { shopDomain } = {}) {
+  if (!OPENAI_API_KEY) {
+    return "Configurazione mancante: OPENAI_API_KEY non impostata.";
+  }
+
   const tools = [
     {
       type: "function",
@@ -195,11 +201,17 @@ async function chatWithTools(messages, { shopDomain } = {}) {
     }
   ];
 
-  let resp = await client.responses.create({
-    model: OPENAI_MODEL,
-    input: messages,
-    tools
-  });
+  let resp;
+  try {
+    resp = await client.responses.create({
+      model: OPENAI_MODEL,
+      input: messages,
+      tools
+    });
+  } catch (e) {
+    console.error("[OpenAI] create error:", e);
+    return "⚠️ Errore AI: " + e.message;
+  }
 
   // Gestione tool calls
   while (true) {
@@ -208,41 +220,46 @@ async function chatWithTools(messages, { shopDomain } = {}) {
 
     const toolResults = [];
     for (const call of toolCalls) {
-      const { name, arguments: args } = call;
-      if (name === "getProductByHandle") {
-        const data = await storefrontGetProductByHandle(args.handle, shopDomain);
-        toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
-      }
-      if (name === "getOrderStatus") {
-        const data = await adminGetOrderStatus(args.email, args.orderNumber, shopDomain);
-        toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
+      try {
+        const { name, arguments: args } = call;
+        if (name === "getProductByHandle") {
+          const data = await storefrontGetProductByHandle(args.handle, shopDomain);
+          toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
+        }
+        if (name === "getOrderStatus") {
+          const data = await adminGetOrderStatus(args.email, args.orderNumber, shopDomain);
+          toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
+        }
+      } catch (e) {
+        toolResults.push({ tool_call_id: call.id, output: JSON.stringify({ error: e.message }) });
       }
     }
 
-    resp = await client.responses.create({
-      model: OPENAI_MODEL,
-      input: [
-        ...messages,
-        ...toolResults.map(tr => ({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.output }))
-      ],
-      tools
-    });
+    try {
+      resp = await client.responses.create({
+        model: OPENAI_MODEL,
+        input: [
+          ...messages,
+          ...toolResults.map(tr => ({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.output }))
+        ],
+        tools
+      });
+    } catch (e) {
+      console.error("[OpenAI] follow-up error:", e);
+      return "⚠️ Errore AI: " + e.message;
+    }
   }
 
-  return resp?.output_text || "Ok.";
+  return resp?.output_text || "…";
 }
 
-// ---------------------
-// Rotta App Proxy (widget)
-// ---------------------
-// ---------------------
-// Rotta App Proxy (widget) — supporta GET e POST
-// ---------------------
+// ===== Rotte =====
+
+// App Proxy (widget) — supporta GET ?message=... e POST {message}
 app.all("/chat-proxy", async (req, res) => {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-
   try {
-    // verifica firma proxy (per ora permissiva)
+    // Verifica firma (bypass in prototipo)
     if (!verifyProxySignature(req.query)) {
       return res.status(401).json({ error: "Invalid signature" });
     }
@@ -250,26 +267,29 @@ app.all("/chat-proxy", async (req, res) => {
     const isGet = req.method === "GET";
     const rawMsg = isGet ? (req.query.message ?? "") : (req.body.message ?? "");
 
-    // Se GET senza message → hint di debug
+    // GET senza message -> hint
     if (isGet && !rawMsg) {
-      return res.json({ ok: true, hint: "Questa rotta accetta GET ?message=... o POST con JSON/urlencoded { message }" });
+      return res.json({ ok: true, hint: "Questa rotta accetta GET ?message=... o POST (JSON/urlencoded) { message }" });
     }
 
     const userMsg = String(rawMsg || "");
     const shopFromProxy = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
 
+    console.log(">>> /chat-proxy:", req.method, "shop:", shopFromProxy, "msg:", userMsg);
+
     const messages = [
       { role: "system", content:
         "Sei l'assistente AI del negozio. Rispondi SOLO in italiano. " +
         "NON inserire MAI link esterni. Se serve un link, usa solo URL interni del negozio (es. /products/handle, /policies). " +
-        "Se non sei sicuro di una risposta, chiedi chiarimenti o invita a contattare l'assistenza."
-      },
+        "Se non sei sicuro di una risposta, chiedi chiarimenti o invita a contattare l'assistenza." },
       { role: "user", content: userMsg }
     ];
 
-    const answer = await chatWithTools(messages, { shopDomain: shopFromProxy });
+    const answer = await chatWithTools(messages, { shopDomain: shopFromProxy }).catch(e => {
+      console.error("Errore chatWithTools:", e);
+      return "⚠️ Errore AI: " + e.message;
+    });
 
-    // blocca link esterni
     const safeAnswer = sanitizeLinks(answer, `https://${shopFromProxy}`);
     res.json({ answer: safeAnswer });
   } catch (e) {
@@ -278,7 +298,7 @@ app.all("/chat-proxy", async (req, res) => {
   }
 });
 
-// (Opzionale) Streaming SSE — spesso l’App Proxy bufferizza; usalo diretto su Render se vuoi
+// Streaming SSE (opzionale; spesso App Proxy bufferizza: usalo diretto sul dominio Render)
 app.get("/chat-proxy-stream", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -286,28 +306,16 @@ app.get("/chat-proxy-stream", async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
 
   const user = req.query.q || "Ciao!";
-  const shopFromProxy = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
   const messages = [
     { role: "system", content: "Sei l'assistente AI del negozio. Rispondi SOLO in italiano. Non usare mai link esterni." },
     { role: "user", content: String(user) }
   ];
 
   try {
-    const stream = await client.responses.stream({
-      model: OPENAI_MODEL,
-      input: messages,
-    });
-
-    stream.on("message", (msg) => {
-      // volendo si può anche sanificare progressivamente
-      res.write(`data:${JSON.stringify(msg)}\n\n`);
-    });
-
+    const stream = await client.responses.stream({ model: OPENAI_MODEL, input: messages });
+    stream.on("message", (msg) => res.write(`data:${JSON.stringify(msg)}\n\n`));
     stream.on("end", () => res.end());
-    stream.on("error", (e) => {
-      res.write(`event: error\ndata:${JSON.stringify({ error: e.message })}\n\n`);
-      res.end();
-    });
+    stream.on("error", (e) => { res.write(`event: error\ndata:${JSON.stringify({ error: e.message })}\n\n`); res.end(); });
   } catch (e) {
     res.write(`event: error\ndata:${JSON.stringify({ error: e.message })}\n\n`);
     res.end();
@@ -325,7 +333,7 @@ app.get("/test", (req, res) => {
       <textarea name="message" style="width:100%;height:120px"></textarea>
       <br><br>
       <button type="submit">Invia</button>
-      <p style="margin-top:16px;color:#666">Nota: la rotta /chat-proxy è pensata per App Proxy (POST JSON). Questa form è solo per provare.</p>
+      <p style="margin-top:16px;color:#666">Puoi anche provare GET: /chat-proxy?message=Ciao</p>
     </form>
   `);
 });
