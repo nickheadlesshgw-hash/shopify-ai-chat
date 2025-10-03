@@ -235,25 +235,29 @@ async function chatWithTools(messages, { shopDomain } = {}) {
 // ---------------------
 // Rotta App Proxy (widget)
 // ---------------------
+// ---------------------
+// Rotta App Proxy (widget) — supporta GET e POST
+// ---------------------
 app.all("/chat-proxy", async (req, res) => {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
 
   try {
-    // se arriva GET (es. aperto da browser) mostri solo un hint
-    if (req.method === "GET") {
-      return res.json({
-        ok: true,
-        hint: "Questa rotta accetta POST con JSON { message: '...' }"
-      });
-    }
-
     // verifica firma proxy (per ora permissiva)
     if (!verifyProxySignature(req.query)) {
       return res.status(401).json({ error: "Invalid signature" });
     }
 
-    // prendi messaggio da body (POST) o query string (fallback)
-    const userMsg = String(req.body.message || req.query.message || "");
+    const isGet = req.method === "GET";
+    const rawMsg = isGet ? (req.query.message ?? "") : (req.body.message ?? "");
+
+    // Se GET senza message → hint di debug
+    if (isGet && !rawMsg) {
+      return res.json({ ok: true, hint: "Questa rotta accetta GET ?message=... o POST con JSON/urlencoded { message }" });
+    }
+
+    const userMsg = String(rawMsg || "");
+    const shopFromProxy = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
+
     const messages = [
       { role: "system", content:
         "Sei l'assistente AI del negozio. Rispondi SOLO in italiano. " +
@@ -263,15 +267,11 @@ app.all("/chat-proxy", async (req, res) => {
       { role: "user", content: userMsg }
     ];
 
-    const answer = await chatWithTools(messages);
+    const answer = await chatWithTools(messages, { shopDomain: shopFromProxy });
 
-    // opzionale: sanitizza link
-    function sanitizeLinks(text) {
-      if (!text) return text;
-      return text.replace(/https?:\/\/[^\s)]+/g, "[link rimosso]");
-    }
-
-    res.json({ answer: sanitizeLinks(answer) });
+    // blocca link esterni
+    const safeAnswer = sanitizeLinks(answer, `https://${shopFromProxy}`);
+    res.json({ answer: safeAnswer });
   } catch (e) {
     console.error("Errore chat-proxy:", e);
     res.status(500).json({ error: e.message });
