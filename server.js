@@ -232,32 +232,48 @@ async function chatWithTools(messages, { shopDomain } = {}) {
   return resp?.output_text || "Ok.";
 }
 
-// ===== Rotte =====
+// ---------------------
+// Rotta App Proxy (widget)
+// ---------------------
+app.all("/chat-proxy", async (req, res) => {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
 
-// App Proxy (widget)
-app.post("/chat-proxy", async (req, res) => {
   try {
+    // se arriva GET (es. aperto da browser) mostri solo un hint
+    if (req.method === "GET") {
+      return res.json({
+        ok: true,
+        hint: "Questa rotta accetta POST con JSON { message: '...' }"
+      });
+    }
+
+    // verifica firma proxy (per ora permissiva)
     if (!verifyProxySignature(req.query)) {
       return res.status(401).json({ error: "Invalid signature" });
     }
 
-    const userMsg = String(req.body.message || "");
-    // Shopify App Proxy passa ?shop=... in query
-    const shopFromProxy = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
-
+    // prendi messaggio da body (POST) o query string (fallback)
+    const userMsg = String(req.body.message || req.query.message || "");
     const messages = [
       { role: "system", content:
         "Sei l'assistente AI del negozio. Rispondi SOLO in italiano. " +
         "NON inserire MAI link esterni. Se serve un link, usa solo URL interni del negozio (es. /products/handle, /policies). " +
-        "Se non sei sicuro di una risposta, chiedi chiarimenti o invita a contattare l'assistenza." },
+        "Se non sei sicuro di una risposta, chiedi chiarimenti o invita a contattare l'assistenza."
+      },
       { role: "user", content: userMsg }
     ];
 
-    const answer = await chatWithTools(messages, { shopDomain: shopFromProxy });
-    const safeAnswer = sanitizeLinks(answer, `https://${shopFromProxy}`);
-    res.json({ answer: safeAnswer });
+    const answer = await chatWithTools(messages);
+
+    // opzionale: sanitizza link
+    function sanitizeLinks(text) {
+      if (!text) return text;
+      return text.replace(/https?:\/\/[^\s)]+/g, "[link rimosso]");
+    }
+
+    res.json({ answer: sanitizeLinks(answer) });
   } catch (e) {
-    console.error(e);
+    console.error("Errore chat-proxy:", e);
     res.status(500).json({ error: e.message });
   }
 });
