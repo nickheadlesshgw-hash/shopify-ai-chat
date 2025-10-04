@@ -23,6 +23,9 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // modello econo
 if (!OPENAI_API_KEY) {
   console.warn("[WARN] OPENAI_API_KEY mancante. /chat-proxy risponderà con errore.");
 }
+if (!SF_TOKEN) {
+  console.warn("[WARN] SHOPIFY_STOREFRONT_TOKEN mancante. I tools prodotti non funzioneranno.");
+}
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -118,30 +121,87 @@ app.get("/auth/callback", async (req, res) => {
   }
 });
 
-// ===== Shopify helpers =====
+// ===== Shopify helpers (Storefront & Admin) =====
 
-// Storefront API (prodotto per handle)
-async function storefrontGetProductByHandle(handle, shopDomain = SHOP_DOMAIN, sfToken = SF_TOKEN) {
-  const url = `https://${shopDomain}/api/2024-07/graphql.json`;
-  const q = `
-    query($handle: String!) {
-      product(handle: $handle) {
-        title handle availableForSale
-        variants(first:1){
-          edges{ node{ id price{ amount currencyCode } availableForSale } }
-        }
-      }
-    }`;
+// Storefront API base caller
+async function storefrontGraphQL({ shopDomain, query, variables }) {
+  const domain = shopDomain || SHOP_DOMAIN;
+  const url = `https://${domain}/api/2024-07/graphql.json`;
   const r = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Storefront-Access-Token": sfToken
+      "X-Shopify-Storefront-Access-Token": SF_TOKEN
     },
-    body: JSON.stringify({ query: q, variables: { handle } })
+    body: JSON.stringify({ query, variables })
   });
   const json = await r.json();
-  return json.data?.product || null;
+  if (json.errors || json.data?.__typename === "GraphQLError") {
+    console.error("[Storefront errors]", JSON.stringify(json));
+  }
+  return json.data;
+}
+
+// 1) Prodotto per handle
+async function storefrontGetProductByHandle(handle, shopDomain = SHOP_DOMAIN) {
+  const q = `
+    query($handle: String!) {
+      product(handle: $handle) {
+        title handle descriptionHtml
+        variants(first:1){ edges{ node{ id price{ amount currencyCode } availableForSale } } }
+      }
+    }`;
+  const data = await storefrontGraphQL({ shopDomain, query: q, variables: { handle } });
+  return data?.product || null;
+}
+
+// 2) Prodotto più economico
+async function storefrontGetCheapestProduct(shopDomain = SHOP_DOMAIN) {
+  // Ordinamento per prezzo ascendente (PRICE), prendiamo il primo prodotto disponibile
+  const q = `
+    query {
+      products(first: 20, sortKey: PRICE, reverse: false) {
+        edges {
+          node {
+            title handle descriptionHtml
+            priceRange { minVariantPrice { amount currencyCode } }
+            availableForSale
+          }
+        }
+      }
+    }`;
+  const data = await storefrontGraphQL({ shopDomain, query: q });
+  const list = data?.products?.edges?.map(e => e.node) || [];
+  const firstAvailable = list.find(p => p.availableForSale) || list[0] || null;
+  return firstAvailable;
+}
+
+// 3) Ricerca prodotti (per titolo/descrizione/tag) con ordinamento per prezzo opzionale
+async function storefrontSearchProducts({ shopDomain = SHOP_DOMAIN, queryText = "", limit = 5, sort = "RELEVANCE" }) {
+  // sort: RELEVANCE | PRICE_ASC | PRICE_DESC
+  let sortKey = "RELEVANCE"; let reverse = false;
+  if (sort === "PRICE_ASC") { sortKey = "PRICE"; reverse = false; }
+  if (sort === "PRICE_DESC") { sortKey = "PRICE"; reverse = true; }
+
+  const q = `
+    query($q: String!, $n: Int!, $reverse: Boolean!, $sortKey: ProductSortKeys!) {
+      products(first: $n, query: $q, reverse: $reverse, sortKey: $sortKey) {
+        edges {
+          node {
+            title handle descriptionHtml
+            priceRange { minVariantPrice { amount currencyCode } }
+            availableForSale
+          }
+        }
+      }
+    }`;
+  const data = await storefrontGraphQL({
+    shopDomain,
+    query: q,
+    variables: { q: queryText, n: Math.max(1, Math.min(20, limit)), reverse, sortKey }
+  });
+  const list = data?.products?.edges?.map(e => e.node) || [];
+  return list;
 }
 
 // Admin API (stato ordine) — prende token da TOKENS[shop] o fallback ENV
@@ -179,11 +239,31 @@ async function chatWithTools(messages, { shopDomain } = {}) {
     {
       type: "function",
       name: "getProductByHandle",
-      description: "Dettagli prodotto dal negozio Shopify",
+      description: "Dettagli prodotto dal negozio Shopify (titolo, descrizione, prezzo) per handle.",
       parameters: {
         type: "object",
-        properties: { handle: { type: "string" } },
+        properties: { handle: { type: "string", description: "Handle del prodotto (slug)" } },
         required: ["handle"]
+      }
+    },
+    {
+      type: "function",
+      name: "getCheapestProduct",
+      description: "Restituisce il prodotto più economico disponibile, con titolo, descrizione e prezzo.",
+      parameters: { type: "object", properties: {} }
+    },
+    {
+      type: "function",
+      name: "searchProducts",
+      description: "Cerca prodotti per parola chiave (titolo/descrizione/tag) e restituisce titolo, descrizione e prezzo.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Query di ricerca (es. 'albero natale')" },
+          limit: { type: "number", description: "Quanti risultati (1-20)", default: 5 },
+          sort:  { type: "string", enum: ["RELEVANCE", "PRICE_ASC", "PRICE_DESC"], default: "RELEVANCE" }
+        },
+        required: ["query"]
       }
     },
     {
@@ -222,10 +302,27 @@ async function chatWithTools(messages, { shopDomain } = {}) {
     for (const call of toolCalls) {
       try {
         const { name, arguments: args } = call;
+
         if (name === "getProductByHandle") {
           const data = await storefrontGetProductByHandle(args.handle, shopDomain);
           toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
         }
+
+        if (name === "getCheapestProduct") {
+          const data = await storefrontGetCheapestProduct(shopDomain);
+          toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
+        }
+
+        if (name === "searchProducts") {
+          const data = await storefrontSearchProducts({
+            shopDomain,
+            queryText: args.query,
+            limit: args.limit || 5,
+            sort: args.sort || "RELEVANCE"
+          });
+          toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
+        }
+
         if (name === "getOrderStatus") {
           const data = await adminGetOrderStatus(args.email, args.orderNumber, shopDomain);
           toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
@@ -281,6 +378,7 @@ app.all("/chat-proxy", async (req, res) => {
       { role: "system", content:
         "Sei l'assistente AI del negozio. Rispondi SOLO in italiano. " +
         "NON inserire MAI link esterni. Se serve un link, usa solo URL interni del negozio (es. /products/handle, /policies). " +
+        "Quando citi un prodotto, includi titolo e una breve descrizione. " +
         "Se non sei sicuro di una risposta, chiedi chiarimenti o invita a contattare l'assistenza." },
       { role: "user", content: userMsg }
     ];
@@ -327,13 +425,13 @@ app.get("/", (req, res) => res.send("AI Chat up ✅"));
 app.get("/test", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(`
-    <form action="/chat-proxy" method="POST" style="max-width:480px;margin:40px auto;font-family:sans-serif">
+    <form action="/chat-proxy" method="GET" style="max-width:480px;margin:40px auto;font-family:sans-serif">
       <h3>Test AI Chat</h3>
       <p>Scrivi un messaggio e invia:</p>
       <textarea name="message" style="width:100%;height:120px"></textarea>
       <br><br>
-      <button type="submit">Invia</button>
-      <p style="margin-top:16px;color:#666">Puoi anche provare GET: /chat-proxy?message=Ciao</p>
+      <button type="submit">Invia (GET)</button>
+      <p style="margin-top:16px;color:#666">Puoi anche provare POST /chat-proxy con body { message }.</p>
     </form>
   `);
 });
