@@ -1,4 +1,4 @@
-// server.js (ADMIN-ONLY)
+// server.js — ADMIN ONLY (no Storefront token)
 import express from "express";
 import bodyParser from "body-parser";
 import crypto from "crypto";
@@ -9,11 +9,12 @@ const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// ===== ENV =====
-const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/$/, "");
-const SHOP_DOMAIN = process.env.SHOP_DOMAIN || ""; // es: buzzhivestore.myshopify.com
+/* ================== ENV ================== */
+const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/$/, ""); // es: https://shopify-ai-chat.onrender.com
+const SHOP_DOMAIN = process.env.SHOP_DOMAIN || ""; // es: wm126i-0y.myshopify.com
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // modello economico
 
 // OAuth
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || "";
@@ -22,28 +23,40 @@ const SHOPIFY_SCOPES =
   process.env.SHOPIFY_SCOPES ||
   "read_products,read_orders,read_app_proxy,write_app_proxy";
 
-// Fallback se vuoi testare senza OAuth (sconsigliato in prod)
+// (opzionale) Fallback Admin token se vuoi testare senza OAuth
 const ADMIN_TOKEN_FALLBACK = process.env.SHOPIFY_ADMIN_TOKEN || "";
 
+/* ============== OpenAI client ============== */
 if (!OPENAI_API_KEY) console.warn("[WARN] OPENAI_API_KEY mancante.");
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// In memoria: token Admin per shop (prototipo)
+/* ============== Memory tokens (proto) ============== */
+// In produzione usa un DB/secret manager
 const TOKENS = new Map(); // Map<shopDomain, admin_access_token>
 
-// ===== Utils =====
-function verifyProxySignature(/* query */) { return true; } // abilita check HMAC in prod
-function isValidShop(shop) { return typeof shop === "string" && /\.myshopify\.com$/.test(shop); }
+/* ================== Utils ================== */
+function isValidShop(shop) {
+  return typeof shop === "string" && /\.myshopify\.com$/.test(shop);
+}
+
+// (PROTOTIPO) lascia true; in prod valida l'HMAC dell'App Proxy
+function verifyProxySignature(/* query */) {
+  return true;
+}
+
+// Blocca link esterni (consente solo link relativi o del dominio dello shop)
 function sanitizeLinks(text, shopDomain) {
   if (!text) return text;
   const allowedHost = (shopDomain || "").replace(/^https?:\/\//, "");
   return String(text)
+    // markdown [label](url)
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, (m, label, url) =>
       url.includes(allowedHost) ? m : `${label} ([link rimosso])`)
-    .replace(/https?:\/\/[^\s)]+/gi, m => (m.includes(allowedHost) ? m : "[link rimosso]"));
+    // URL plain
+    .replace(/https?:\/\/[^\s)]+/gi, (m) => (m.includes(allowedHost) ? m : "[link rimosso]"));
 }
 
-// ===== OAuth =====
+/* ================== OAuth ================== */
 function buildInstallUrl({ shop, state }) {
   const params = new URLSearchParams({
     client_id: SHOPIFY_CLIENT_ID,
@@ -53,35 +66,54 @@ function buildInstallUrl({ shop, state }) {
   });
   return `https://${shop}/admin/oauth/authorize?${params.toString()}`;
 }
+
 function verifyHmacQuery(queryObj, secret) {
   const q = { ...queryObj };
   const hmac = q.hmac;
   if (!hmac) return false;
-  delete q.hmac; delete q.signature;
-  const message = Object.keys(q).sort().map(k => `${k}=${Array.isArray(q[k]) ? q[k].join(",") : q[k]}`).join("&");
+  delete q.hmac;
+  delete q.signature;
+  const message = Object.keys(q)
+    .sort()
+    .map((k) => `${k}=${Array.isArray(q[k]) ? q[k].join(",") : q[k]}`)
+    .join("&");
   const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
-  try { return crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8")); }
-  catch { return false; }
+  try {
+    return crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
+  } catch {
+    return false;
+  }
 }
+
+// Start install
 app.get("/auth/start", (req, res) => {
   const shop = String(req.query.shop || "").toLowerCase();
   if (!isValidShop(shop)) return res.status(400).send("Parametro 'shop' non valido");
-  const state = crypto.randomBytes(16).toString("hex"); // salva/verifica in prod
+  const state = crypto.randomBytes(16).toString("hex"); // in prod salva/verifica lo state
   res.redirect(buildInstallUrl({ shop, state }));
 });
+
+// Callback
 app.get("/auth/callback", async (req, res) => {
   try {
     const { shop, code } = req.query;
     if (!isValidShop(shop)) return res.status(400).send("Shop non valido");
-    if (!verifyHmacQuery(req.query, SHOPIFY_CLIENT_SECRET)) return res.status(400).send("HMAC non valido");
+    if (!verifyHmacQuery(req.query, SHOPIFY_CLIENT_SECRET)) {
+      return res.status(400).send("HMAC non valido");
+    }
     const r = await fetch(`https://${shop}/admin/oauth/access_token`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_id: SHOPIFY_CLIENT_ID, client_secret: SHOPIFY_CLIENT_SECRET, code })
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_CLIENT_SECRET,
+        code
+      })
     });
     const json = await r.json();
     if (!json.access_token) throw new Error("Nessun access_token");
     TOKENS.set(shop, json.access_token);
-    console.log(`[OAuth] Install OK for ${shop} — token: ${json.access_token.slice(0,6)}...`);
+    console.log(`[OAuth] Install OK for ${shop} — token: ${json.access_token.slice(0, 6)}...`);
     res.send("Installazione completata ✅ Puoi chiudere questa pagina.");
   } catch (e) {
     console.error("[OAuth] Error:", e);
@@ -89,7 +121,7 @@ app.get("/auth/callback", async (req, res) => {
   }
 });
 
-// ===== Admin API helpers =====
+/* ============== Admin API helpers ============== */
 async function adminGraphQL({ shopDomain, query, variables }) {
   const domain = shopDomain || SHOP_DOMAIN;
   const adminToken = TOKENS.get(domain) || ADMIN_TOKEN_FALLBACK;
@@ -101,11 +133,14 @@ async function adminGraphQL({ shopDomain, query, variables }) {
     body: JSON.stringify({ query, variables })
   });
   const json = await r.json();
-  if (json.errors) { console.error("[Admin errors]", JSON.stringify(json.errors)); throw new Error("Errore Admin API"); }
+  if (json.errors) {
+    console.error("[Admin errors]", JSON.stringify(json.errors));
+    throw new Error("Errore Admin API");
+  }
   return json.data;
 }
 
-// — getProductByHandle (titolo/descrizione/prezzo) —
+// Prodotto per handle
 async function adminGetProductByHandle(handle, shopDomain = SHOP_DOMAIN) {
   const q = `
     query($q:String!) {
@@ -119,11 +154,15 @@ async function adminGetProductByHandle(handle, shopDomain = SHOP_DOMAIN) {
         }
       }
     }`;
-  const data = await adminGraphQL({ shopDomain, query: q, variables: { q: `handle:${handle}` } });
+  const data = await adminGraphQL({
+    shopDomain,
+    query: q,
+    variables: { q: `handle:${handle}` }
+  });
   return data?.products?.edges?.[0]?.node || null;
 }
 
-// — getCheapestProduct (prodotto attivo con prezzo minore) —
+// Prodotto più economico (tra i primi 100 attivi)
 async function adminGetCheapestProduct(shopDomain = SHOP_DOMAIN) {
   const q = `
     query {
@@ -137,18 +176,30 @@ async function adminGetCheapestProduct(shopDomain = SHOP_DOMAIN) {
       }
     }`;
   const data = await adminGraphQL({ shopDomain, query: q });
-  const list = (data?.products?.edges || []).map(e => e.node);
-  let cheapest = null, min = Infinity, curr = "EUR";
+  const list = (data?.products?.edges || []).map((e) => e.node);
+
+  let cheapest = null,
+    min = Infinity,
+    curr = "EUR";
   for (const p of list) {
     const amt = parseFloat(p?.priceRangeV2?.minVariantPrice?.amount || "NaN");
     const code = p?.priceRangeV2?.minVariantPrice?.currencyCode || "EUR";
-    if (!isNaN(amt) && amt < min) { min = amt; curr = code; cheapest = { ...p, _min: amt, _ccy: code }; }
+    if (!isNaN(amt) && amt < min) {
+      min = amt;
+      curr = code;
+      cheapest = { ...p, _min: amt, _ccy: code };
+    }
   }
   return cheapest ? { ...cheapest, minPrice: { amount: String(min), currencyCode: curr } } : null;
 }
 
-// — searchProducts (testo + sort prezzo opzionale) —
-async function adminSearchProducts({ shopDomain = SHOP_DOMAIN, queryText = "", limit = 5, sort = "RELEVANCE" }) {
+// Ricerca prodotti testuale + sort prezzo opzionale
+async function adminSearchProducts({
+  shopDomain = SHOP_DOMAIN,
+  queryText = "",
+  limit = 5,
+  sort = "RELEVANCE"
+}) {
   const q = `
     query($q:String!, $n:Int!) {
       products(first:$n, query:$q) {
@@ -160,17 +211,33 @@ async function adminSearchProducts({ shopDomain = SHOP_DOMAIN, queryText = "", l
         }
       }
     }`;
-  const data = await adminGraphQL({ shopDomain, query: q, variables: { q: queryText, n: Math.max(1, Math.min(20, limit)) } });
-  let list = (data?.products?.edges || []).map(e => {
+  const data = await adminGraphQL({
+    shopDomain,
+    query: q,
+    variables: { q: queryText, n: Math.max(1, Math.min(20, limit)) }
+  });
+  let list = (data?.products?.edges || []).map((e) => {
     const n = e.node;
     return { ...n, minPrice: n.priceRangeV2?.minVariantPrice || null };
   });
-  if (sort === "PRICE_ASC") list.sort((a,b)=> parseFloat(a?.minPrice?.amount||"Infinity")-parseFloat(b?.minPrice?.amount||"Infinity"));
-  if (sort === "PRICE_DESC") list.sort((a,b)=> parseFloat(b?.minPrice?.amount||"-Infinity")-parseFloat(a?.minPrice?.amount||"-Infinity"));
+
+  if (sort === "PRICE_ASC") {
+    list.sort(
+      (a, b) =>
+        parseFloat(a?.minPrice?.amount || "Infinity") -
+        parseFloat(b?.minPrice?.amount || "Infinity")
+    );
+  } else if (sort === "PRICE_DESC") {
+    list.sort(
+      (a, b) =>
+        parseFloat(b?.minPrice?.amount || "-Infinity") -
+        parseFloat(a?.minPrice?.amount || "-Infinity")
+    );
+  }
   return list;
 }
 
-// — ordine (email + numero) —
+// Stato ordine (email + numero)
 async function adminGetOrderStatus(email, orderNumber, shopDomain = SHOP_DOMAIN) {
   const q = `
     query($q:String!) {
@@ -178,11 +245,15 @@ async function adminGetOrderStatus(email, orderNumber, shopDomain = SHOP_DOMAIN)
         edges { node { id name displayFinancialStatus displayFulfillmentStatus email } }
       }
     }`;
-  const data = await adminGraphQL({ shopDomain, query: q, variables: { q: `name:${orderNumber} email:${email}` } });
+  const data = await adminGraphQL({
+    shopDomain,
+    query: q,
+    variables: { q: `name:${orderNumber} email:${email}` }
+  });
   return data?.orders?.edges?.[0]?.node || null;
 }
 
-// ===== OpenAI + tools =====
+/* ============== OpenAI + Tools ============== */
 async function chatWithTools(messages, { shopDomain } = {}) {
   if (!OPENAI_API_KEY) return "Configurazione mancante: OPENAI_API_KEY non impostata.";
 
@@ -191,7 +262,11 @@ async function chatWithTools(messages, { shopDomain } = {}) {
       type: "function",
       name: "getProductByHandle",
       description: "Dettagli prodotto (titolo, descrizione, prezzo) per handle.",
-      parameters: { type: "object", properties: { handle: { type: "string" } }, required: ["handle"] }
+      parameters: {
+        type: "object",
+        properties: { handle: { type: "string" } },
+        required: ["handle"]
+      }
     },
     {
       type: "function",
@@ -202,13 +277,14 @@ async function chatWithTools(messages, { shopDomain } = {}) {
     {
       type: "function",
       name: "searchProducts",
-      description: "Cerca prodotti per parole chiave (titolo/descrizione/tag) e ritorna titolo/descrizione/prezzo.",
+      description:
+        "Cerca prodotti per parole chiave (titolo/descrizione/tag) e ritorna titolo/descrizione/prezzo.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string" },
           limit: { type: "number", default: 5 },
-          sort:  { type: "string", enum: ["RELEVANCE","PRICE_ASC","PRICE_DESC"], default: "RELEVANCE" }
+          sort: { type: "string", enum: ["RELEVANCE", "PRICE_ASC", "PRICE_DESC"], default: "RELEVANCE" }
         },
         required: ["query"]
       }
@@ -220,7 +296,7 @@ async function chatWithTools(messages, { shopDomain } = {}) {
       parameters: {
         type: "object",
         properties: { email: { type: "string" }, orderNumber: { type: "string" } },
-        required: ["email","orderNumber"]
+        required: ["email", "orderNumber"]
       }
     }
   ];
@@ -234,7 +310,7 @@ async function chatWithTools(messages, { shopDomain } = {}) {
   }
 
   while (true) {
-    const toolCalls = resp?.output?.filter(o => o.type === "tool_call") || [];
+    const toolCalls = resp?.output?.filter((o) => o.type === "tool_call") || [];
     if (!toolCalls.length) break;
 
     const toolResults = [];
@@ -252,7 +328,10 @@ async function chatWithTools(messages, { shopDomain } = {}) {
         }
         if (name === "searchProducts") {
           const data = await adminSearchProducts({
-            shopDomain, queryText: args.query, limit: args.limit || 5, sort: args.sort || "RELEVANCE"
+            shopDomain,
+            queryText: args.query,
+            limit: args.limit || 5,
+            sort: args.sort || "RELEVANCE"
           });
           toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
         }
@@ -270,7 +349,7 @@ async function chatWithTools(messages, { shopDomain } = {}) {
         model: OPENAI_MODEL,
         input: [
           ...messages,
-          ...toolResults.map(tr => ({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.output }))
+          ...toolResults.map((tr) => ({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.output }))
         ],
         tools
       });
@@ -283,16 +362,20 @@ async function chatWithTools(messages, { shopDomain } = {}) {
   return resp?.output_text || "…";
 }
 
-// ===== App Proxy =====
+/* ============== App Proxy (widget) ============== */
 app.all("/chat-proxy", async (req, res) => {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   try {
-    if (!verifyProxySignature(req.query)) return res.status(401).json({ error: "Invalid signature" });
+    if (!verifyProxySignature(req.query)) {
+      return res.status(401).json({ error: "Invalid signature" });
+    }
 
     const isGet = req.method === "GET";
     const rawMsg = isGet ? (req.query.message ?? "") : (req.body.message ?? "");
+
+    // Hint GET senza message
     if (isGet && !rawMsg) {
-      return res.json({ ok: true, hint: "GET ?message=... o POST { message }" });
+      return res.json({ ok: true, hint: "GET ?message=... o POST (JSON/urlencoded) { message }" });
     }
 
     const userMsg = String(rawMsg || "");
@@ -301,14 +384,17 @@ app.all("/chat-proxy", async (req, res) => {
     console.log(">>> /chat-proxy:", req.method, "shop:", shopFromProxy, "msg:", userMsg);
 
     const messages = [
-      { role: "system", content:
-        "Sei l'assistente AI del negozio. Rispondi SOLO in italiano. " +
-        "NON inserire MAI link esterni. Se serve un link, usa solo URL interni del negozio (es. /products/handle, /policies). " +
-        "Quando suggerisci prodotti, includi titolo, breve descrizione e prezzo; se possibile fornisci anche il percorso interno /products/<handle>." },
+      {
+        role: "system",
+        content:
+          "Sei l'assistente AI del negozio. Rispondi SOLO in italiano. " +
+          "NON inserire MAI link esterni. Se serve un link, usa solo URL interni del negozio (es. /products/handle, /policies). " +
+          "Quando suggerisci prodotti, includi titolo, breve descrizione e prezzo; se possibile aggiungi il percorso /products/<handle>."
+      },
       { role: "user", content: userMsg }
     ];
 
-    const answer = await chatWithTools(messages, { shopDomain: shopFromProxy }).catch(e => {
+    const answer = await chatWithTools(messages, { shopDomain: shopFromProxy }).catch((e) => {
       console.error("Errore chatWithTools:", e);
       return "⚠️ Errore AI: " + e.message;
     });
@@ -321,7 +407,51 @@ app.all("/chat-proxy", async (req, res) => {
   }
 });
 
-// ===== Misc =====
+/* ============== Rotte di Debug ============== */
+// Prodotto più economico
+app.get("/debug/cheapest", async (req, res) => {
+  try {
+    const shop = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
+    const p = await adminGetCheapestProduct(shop);
+    if (!p) return res.status(404).json({ ok: false, msg: "Nessun prodotto attivo con prezzo trovato." });
+    res.json({
+      ok: true,
+      title: p.title,
+      handle: p.handle,
+      price: p.minPrice?.amount + " " + (p.minPrice?.currencyCode || ""),
+      preview: "/products/" + p.handle,
+      description: (p.bodyHtml || "").replace(/<[^>]+>/g, "").slice(0, 180) + "..."
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Ricerca: ?q=parole&limit=5&sort=PRICE_ASC|PRICE_DESC|RELEVANCE
+app.get("/debug/search", async (req, res) => {
+  try {
+    const shop = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
+    const q = String(req.query.q || "");
+    const limit = Number(req.query.limit || 5);
+    const sort = String(req.query.sort || "RELEVANCE");
+    const list = await adminSearchProducts({ shopDomain: shop, queryText: q, limit, sort });
+    res.json({
+      ok: true,
+      count: list.length,
+      items: list.map((p) => ({
+        title: p.title,
+        handle: p.handle,
+        price: p.minPrice?.amount + " " + (p.minPrice?.currencyCode || ""),
+        preview: "/products/" + p.handle,
+        description: (p.bodyHtml || "").replace(/<[^>]+>/g, "").slice(0, 180) + "..."
+      }))
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* ============== Misc ============== */
 app.get("/", (req, res) => res.send("AI Chat up ✅"));
 app.get("/test", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -335,5 +465,6 @@ app.get("/test", (req, res) => {
   `);
 });
 
+/* ============== Start ============== */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`AI Chat server ascolta su :${PORT}`));
