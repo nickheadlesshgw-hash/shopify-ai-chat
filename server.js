@@ -1,4 +1,4 @@
-// server.js — Shopify AI Chat (Admin-only, OAuth, App Proxy, Tools + Intent Fallback)
+// server.js — Shopify AI Chat (Admin-only, OAuth, App Proxy, Context-aware, Budget gifts)
 import express from "express";
 import bodyParser from "body-parser";
 import crypto from "crypto";
@@ -11,19 +11,20 @@ app.use(express.urlencoded({ extended: true }));
 
 /* ========== ENV ========== */
 const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/$/, ""); // es: https://shopify-ai-chat.onrender.com
-const SHOP_DOMAIN = process.env.SHOP_DOMAIN || ""; // es: wm126i-0y.myshopify.com
+const SHOP_DOMAIN   = process.env.SHOP_DOMAIN || "";                     // es: wm126i-0y.myshopify.com
+const PUBLIC_STORE_URL = (process.env.PUBLIC_STORE_URL || "https://buzzhivestore.com").replace(/\/$/, "");
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // economico e veloce
+const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini";        // economico e veloce
 
 // OAuth
-const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || "";
+const SHOPIFY_CLIENT_ID     = process.env.SHOPIFY_CLIENT_ID || "";
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || "";
 const SHOPIFY_SCOPES =
   process.env.SHOPIFY_SCOPES ||
-  "read_products,read_orders,read_app_proxy,write_app_proxy";
+  "read_products,read_app_proxy,write_app_proxy";
 
-// opzionale: fallback token admin per test senza OAuth
+// opzionale: fallback token admin per test senza OAuth (sconsigliato in prod)
 const ADMIN_TOKEN_FALLBACK = process.env.SHOPIFY_ADMIN_TOKEN || "";
 
 /* ========== OpenAI ========== */
@@ -37,11 +38,15 @@ const TOKENS = new Map(); // Map<shopDomain, admin_access_token>
 function isValidShop(shop) {
   return typeof shop === "string" && /\.myshopify\.com$/.test(shop);
 }
-function verifyProxySignature(/*query*/) { return true; } // abilita HMAC in prod
+function verifyProxySignature(/*query*/) { return true; } // abilita HMAC in produzione
 
-function sanitizeLinks(text, shopDomain) {
+function productUrl(handle) {
+  return `${PUBLIC_STORE_URL}/products/${handle}`;
+}
+
+function sanitizeLinks(text) {
   if (!text) return text;
-  const allowedHost = (shopDomain || "").replace(/^https?:\/\//, "");
+  const allowedHost = PUBLIC_STORE_URL.replace(/^https?:\/\//, "");
   return String(text)
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, (m, label, url) =>
       url.includes(allowedHost) ? m : `${label} ([link rimosso])`)
@@ -64,7 +69,7 @@ function verifyHmacQuery(queryObj, secret) {
   if (!hmac) return false;
   delete q.hmac; delete q.signature;
   const message = Object.keys(q).sort().map(k => `${k}=${Array.isArray(q[k]) ? q[k].join(",") : q[k]}`).join("&");
-  const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
+  const digest  = crypto.createHmac("sha256", secret).update(message).digest("hex");
   try { return crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8")); }
   catch { return false; }
 }
@@ -72,7 +77,7 @@ function verifyHmacQuery(queryObj, secret) {
 app.get("/auth/start", (req, res) => {
   const shop = String(req.query.shop || "").toLowerCase();
   if (!isValidShop(shop)) return res.status(400).send("Parametro 'shop' non valido");
-  const state = crypto.randomBytes(16).toString("hex"); // in prod salva e verifica
+  const state = crypto.randomBytes(16).toString("hex"); // in prod salva/verifica
   res.redirect(buildInstallUrl({ shop, state }));
 });
 
@@ -97,7 +102,7 @@ app.get("/auth/callback", async (req, res) => {
   }
 });
 
-/* ========== Admin API helpers (GraphQL e REST) ========== */
+/* ========== Admin API helpers (GraphQL/REST) ========== */
 function getAdminToken(domain) {
   return TOKENS.get(domain) || ADMIN_TOKEN_FALLBACK;
 }
@@ -141,90 +146,141 @@ async function adminGetProductByHandle(handle, shopDomain = SHOP_DOMAIN) {
     title: node.title,
     handle: node.handle,
     price: node.priceRangeV2?.minVariantPrice?.amount || null,
-    currency: node.priceRangeV2?.minVariantPrice?.currencyCode || null,
+    currency: node.priceRangeV2?.minVariantPrice?.currencyCode || "EUR",
     description: (node.bodyHtml || "").replace(/<[^>]+>/g, "")
   };
 }
 
-// — Cheapest product (REST: products + variants) —
-async function adminGetCheapestProduct(shopDomain = SHOP_DOMAIN) {
+// — Elenco prodotti attivi (REST) con prezzo minimo calcolato —
+async function adminListActiveProducts(shopDomain = SHOP_DOMAIN) {
   const domain = shopDomain || SHOP_DOMAIN;
   const adminToken = getAdminToken(domain);
   if (!adminToken) throw new Error("Admin token mancante: esegui OAuth /auth/start?shop=SHOP");
 
-  // prendiamo 250 prodotti max per sicurezza
   const url = `https://${domain}/admin/api/2024-07/products.json?status=active&limit=250`;
   const r = await fetch(url, { headers: { "X-Shopify-Access-Token": adminToken } });
   const json = await r.json();
+  const items = Array.isArray(json.products) ? json.products : [];
 
-  const products = Array.isArray(json.products) ? json.products : [];
-  let best = null;
-  for (const p of products) {
-    for (const v of (p.variants || [])) {
+  return items.map(p => {
+    const minVariant = (p.variants || []).reduce((min, v) => {
       const pr = parseFloat(v.price);
-      if (isNaN(pr)) continue;
-      if (!best || pr < best.price) {
-        best = {
-          title: p.title,
-          handle: p.handle,
-          price: pr,
-          currency: p?.variants?.[0]?.presentment_prices?.[0]?.price?.currency || "EUR",
-          description: (p.body_html || "").replace(/<[^>]+>/g, "").slice(0, 220),
-        };
-      }
-    }
-  }
+      if (isNaN(pr)) return min;
+      return (min === null || pr < min) ? pr : min;
+    }, null);
+
+    return {
+      title: p.title,
+      handle: p.handle,
+      price: typeof minVariant === "number" ? minVariant : null,
+      currency: "EUR",
+      description: (p.body_html || "").replace(/<[^>]+>/g, "").slice(0, 220),
+      tags: p.tags || ""
+    };
+  }).filter(p => typeof p.price === "number");
+}
+
+// — Cheapest product (tra gli attivi) —
+async function adminGetCheapestProduct(shopDomain = SHOP_DOMAIN) {
+  const list = await adminListActiveProducts(shopDomain);
+  if (!list.length) return null;
+  let best = list[0];
+  for (const p of list) if (p.price < best.price) best = p;
   return best;
 }
 
-// — Search products (GraphQL full-text + sort in JS) —
-async function adminSearchProducts({ shopDomain = SHOP_DOMAIN, queryText = "", limit = 5, sort = "RELEVANCE" }) {
-  const q = `
-    query($q:String!, $n:Int!) {
-      products(first:$n, query:$q) {
-        edges {
-          node {
-            id title handle bodyHtml
-            priceRangeV2 { minVariantPrice { amount currencyCode } }
-          }
-        }
-      }
-    }`;
-  const data = await adminGraphQL({ shopDomain, query: q, variables: { q: queryText, n: Math.max(1, Math.min(50, limit)) }});
-  let list = (data?.products?.edges || []).map(e => {
-    const n = e.node;
-    return {
-      title: n.title,
-      handle: n.handle,
-      price: parseFloat(n.priceRangeV2?.minVariantPrice?.amount || "NaN"),
-      currency: n.priceRangeV2?.minVariantPrice?.currencyCode || "EUR",
-      description: (n.bodyHtml || "").replace(/<[^>]+>/g, "").slice(0, 200)
-    };
-  });
-  if (sort === "PRICE_ASC")   list = list.filter(p=>!isNaN(p.price)).sort((a,b)=>a.price-b.price);
-  if (sort === "PRICE_DESC")  list = list.filter(p=>!isNaN(p.price)).sort((a,b)=>b.price-a.price);
-  return list;
+// — Ricerca semplice per keywords (su titolo/descrizione/tag) —
+function keywordScore(text, keywords) {
+  const t = (text || "").toLowerCase();
+  const arr = Array.isArray(keywords) ? keywords : String(keywords || "").split(/\s+/);
+  let score = 0;
+  for (const k of arr) {
+    if (!k) continue;
+    const m = t.split(String(k).toLowerCase()).length - 1;
+    score += m > 0 ? m : 0;
+  }
+  return score;
+}
+async function findByKeywords({ shopDomain, queryText, limit = 5, sort = "RELEVANCE" }) {
+  const kw = String(queryText || "").trim();
+  if (!kw) return [];
+  const items = await adminListActiveProducts(shopDomain);
+  let list = items.map(p => ({ ...p, _score: keywordScore(`${p.title} ${p.description} ${p.tags}`, kw.split(/\s+/)) }));
+  if (sort === "RELEVANCE")  list = list.sort((a,b) => b._score - a._score);
+  if (sort === "PRICE_ASC")  list = list.sort((a,b) => a.price - b.price);
+  if (sort === "PRICE_DESC") list = list.sort((a,b) => b.price - a.price);
+  return list.slice(0, limit);
+}
+async function recommendByBudgetAndInterests({ shopDomain, budget, interestsText, limit = 5 }) {
+  const interests = String(interestsText || "")
+    .replace(/[^\w\sàèéìòù]/gi, " ")
+    .split(/\s+/).filter(Boolean);
+  const all = await adminListActiveProducts(shopDomain);
+  const filtered = all
+    .filter(p => p.price <= budget)
+    .map(p => ({ ...p, _score: keywordScore(`${p.title} ${p.description} ${p.tags}`, interests) }))
+    .sort((a,b) => (b._score !== a._score) ? (b._score - a._score) : (a.price - b.price))
+    .slice(0, limit);
+  return filtered;
 }
 
-/* ========== OpenAI Tools + Fallback Intent ========== */
-async function chatWithTools(messages, { shopDomain }) {
-  // 1) Router a parole chiave (garantisce risposta anche se il modello non invoca tools)
-  const userText = (messages.find(m => m.role === "user")?.content || "").toLowerCase();
+/* ========== OpenAI Tools + Intenti ========== */
+async function chatWithTools(messages, { shopDomain, context = {} } = {}) {
+  const userText = (messages.find(m => m.role === "user")?.content || "");
 
-  // pattern per “prodotto più economico”
-  const cheapestIntent = /(prodotto|articolo).*(pi[uù] economico|meno costoso|piu economico|piu' economico|che costa meno)|pi[uù] economico/;
-  if (cheapestIntent.test(userText)) {
-    try {
-      const p = await adminGetCheapestProduct(shopDomain);
-      if (!p) return "Non ho trovato prodotti attivi con un prezzo valido.";
-      return `Il prodotto più economico è **${p.title}** a ${p.price} ${p.currency}. Puoi vederlo qui: /products/${p.handle}.` ;
-    } catch (e) {
-      console.error("[Cheapest fallback] Error:", e);
-      // continua con LLM
+  // 0) Domande rapide sul prodotto della pagina (usa handle dal contesto)
+  if (context?.pageType === "product" && context?.product?.handle) {
+    const h = context.product.handle;
+    const quick = /(prezzo|quanto costa|descrizione|informazioni|info|cos'?è|dimensioni|ingredienti|taglie|materiale)/i;
+    if (quick.test(userText)) {
+      const p = await adminGetProductByHandle(h, shopDomain);
+      if (p) {
+        return `**${p.title}** — ${p.price} ${p.currency}\n${p.description}\nLink: ${productUrl(p.handle)}`;
+      }
     }
   }
 
-  // 2) LLM con tools (per tutte le altre richieste)
+  // 1) Intent "più economico"
+  const cheapIntent = /(prodotto|articolo).*(pi[uù] economico|meno costoso|che costa meno)|pi[uù] economico/i;
+  if (cheapIntent.test(userText)) {
+    const p = await adminGetCheapestProduct(shopDomain);
+    if (p) return `Il prodotto più economico è **${p.title}** a ${p.price} EUR. Link: ${productUrl(p.handle)}`;
+  }
+
+  // 2) Intent "regalo" + budget (€) + gusti/interessi
+  const giftIntent = /(regalo|idea|consiglio).*(fidanzat[oa]?|amico|amica|papà|mamma|collega|lei|lui|bambin[oa])/i;
+  const money = userText.match(/(\d+[,.]?\d*)\s?€|\beuro\b\s?(\d+[,.]?\d*)/i);
+  if (giftIntent.test(userText) && money) {
+    const num = Number((money[1] || money[2]).replace(",", "."));
+    const recs = await recommendByBudgetAndInterests({
+      shopDomain,
+      budget: num,
+      interestsText: userText,
+      limit: 5
+    });
+    if (recs.length) {
+      return (
+        `Ecco alcune idee entro **${num} €**:\n\n` +
+        recs.map(p => `• **${p.title}** — ${p.price} EUR\n  ${productUrl(p.handle)}`).join("\n")
+      );
+    }
+    return `Non ho trovato articoli entro ${num} €. Vuoi aumentare il budget o darmi altri interessi?`;
+  }
+
+  // 3) Intent "cerca X" o query breve → ricerca per keyword
+  const searchIntent = /(cerc|avete|vendete|offrite|trova|mostra|cerco)/i;
+  if (searchIntent.test(userText) || userText.split(/\s+/).length <= 4) {
+    const cleaned = userText.replace(/avete|vendete|offrite|cerca|cercami|trova|mostra|cerco/gi, "").trim();
+    const list = await findByKeywords({ shopDomain, queryText: cleaned || userText, limit: 5, sort: "RELEVANCE" });
+    if (list.length) {
+      return (
+        `Ho trovato questi risultati per **${cleaned || userText}**:\n\n` +
+        list.map(p => `• **${p.title}** — ${p.price} EUR\n  ${productUrl(p.handle)}`).join("\n")
+      );
+    }
+  }
+
+  // 4) LLM + tools (fallback per casi complessi)
   const tools = [
     {
       type: "function",
@@ -234,21 +290,11 @@ async function chatWithTools(messages, { shopDomain }) {
     },
     {
       type: "function",
-      name: "getCheapestProduct",
-      description: "Restituisce il prodotto attivo meno costoso del negozio.",
-      parameters: { type:"object", properties: {} }
-    },
-    {
-      type: "function",
       name: "searchProducts",
       description: "Cerca prodotti per testo e ritorna liste (titolo, prezzo, handle).",
       parameters: {
         type:"object",
-        properties:{
-          query:{ type:"string" },
-          limit:{ type:"number", default:5 },
-          sort:{ type:"string", enum:["RELEVANCE","PRICE_ASC","PRICE_DESC"], default:"RELEVANCE" }
-        },
+        properties:{ query:{ type:"string" }, limit:{ type:"number", default:5 } },
         required:["query"]
       }
     }
@@ -263,32 +309,23 @@ async function chatWithTools(messages, { shopDomain }) {
   }
 
   while (true) {
-    const toolCalls = resp?.output?.filter(o => o.type === "tool_call") || [];
-    if (!toolCalls.length) break;
+    const calls = resp?.output?.filter(o => o.type === "tool_call") || [];
+    if (!calls.length) break;
 
-    const toolResults = [];
-    for (const call of toolCalls) {
+    const outs = [];
+    for (const call of calls) {
       const { name, arguments: args } = call;
       try {
         if (name === "getProductByHandle") {
           const data = await adminGetProductByHandle(args.handle, shopDomain);
-          toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
-        }
-        if (name === "getCheapestProduct") {
-          const data = await adminGetCheapestProduct(shopDomain);
-          toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
+          outs.push({ tool_call_id: call.id, output: JSON.stringify(data) });
         }
         if (name === "searchProducts") {
-          const data = await adminSearchProducts({
-            shopDomain,
-            queryText: args.query,
-            limit: args.limit || 5,
-            sort: args.sort || "RELEVANCE"
-          });
-          toolResults.push({ tool_call_id: call.id, output: JSON.stringify(data) });
+          const data = await findByKeywords({ shopDomain, queryText: args.query, limit: args.limit || 5 });
+          outs.push({ tool_call_id: call.id, output: JSON.stringify(data) });
         }
       } catch (e) {
-        toolResults.push({ tool_call_id: call.id, output: JSON.stringify({ error: e.message }) });
+        outs.push({ tool_call_id: call.id, output: JSON.stringify({ error: e.message }) });
       }
     }
 
@@ -297,7 +334,7 @@ async function chatWithTools(messages, { shopDomain }) {
         model: OPENAI_MODEL,
         input: [
           ...messages,
-          ...toolResults.map(tr => ({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.output }))
+          ...outs.map(o => ({ role: "tool", tool_call_id: o.tool_call_id, content: o.output }))
         ],
         tools
       });
@@ -316,9 +353,10 @@ app.all("/chat-proxy", async (req, res) => {
   try {
     if (!verifyProxySignature(req.query)) return res.status(401).json({ error:"Invalid signature" });
 
-    const isGet = req.method === "GET";
+    const isGet  = req.method === "GET";
     const rawMsg = isGet ? (req.query.message ?? "") : (req.body.message ?? "");
-    if (isGet && !rawMsg) return res.json({ ok:true, hint:"GET ?message=... o POST { message }" });
+    const ctx    = isGet ? {} : (req.body.context || {});
+    if (isGet && !rawMsg) return res.json({ ok:true, hint:"GET ?message=... o POST { message, context }" });
 
     const userMsg = String(rawMsg || "");
     const shopFromProxy = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
@@ -328,24 +366,23 @@ app.all("/chat-proxy", async (req, res) => {
     const messages = [
       { role:"system", content:
         "Sei l'assistente AI del negozio. Rispondi SOLO in italiano. " +
-        "NON inserire MAI link esterni. Se serve un link, usa solo URL interni del negozio (es. /products/handle, /policies). " +
-        "Quando suggerisci prodotti, includi titolo, breve descrizione e prezzo e, se possibile, il percorso /products/<handle>."
-      },
+        "NON inserire MAI link esterni. Quando devi linkare un prodotto usa SEMPRE URL assoluti del negozio. " +
+        `Il dominio pubblico è: ${PUBLIC_STORE_URL}. Genera quindi link del tipo ${PUBLIC_STORE_URL}/products/<handle>. ` +
+        "Quando suggerisci prodotti, includi titolo, breve descrizione e prezzo." },
       { role:"user", content: userMsg }
     ];
 
-    const answer = await chatWithTools(messages, { shopDomain: shopFromProxy })
+    const answer = await chatWithTools(messages, { shopDomain: shopFromProxy, context: ctx })
       .catch(e => { console.error("chatWithTools error:", e); return "⚠️ Errore AI: " + e.message; });
 
-    const safeAnswer = sanitizeLinks(answer, `https://${shopFromProxy}`);
-    res.json({ answer: safeAnswer });
+    res.json({ answer: sanitizeLinks(answer) });
   } catch (e) {
     console.error("Errore /chat-proxy:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-/* ========== Debug endpoints ========== */
+/* ========== Debug endpoints (facoltativi) ========== */
 app.get("/debug/cheapest", async (req, res) => {
   try {
     const shop = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
@@ -355,29 +392,27 @@ app.get("/debug/cheapest", async (req, res) => {
       ok:true,
       title: p.title,
       handle: p.handle,
-      price: `${p.price} ${p.currency || ""}`.trim(),
-      preview: `/products/${p.handle}`,
+      price: `${p.price} EUR`,
+      url: productUrl(p.handle),
       description: p.description
     });
   } catch (e) {
     res.status(500).json({ ok:false, error:e.message });
   }
 });
-
 app.get("/debug/search", async (req, res) => {
   try {
-    const shop = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
-    const q = String(req.query.q || "");
+    const shop  = String(req.query.shop || SHOP_DOMAIN).toLowerCase();
+    const q     = String(req.query.q || "");
     const limit = Number(req.query.limit || 5);
-    const sort = String(req.query.sort || "RELEVANCE");
-    const list = await adminSearchProducts({ shopDomain: shop, queryText: q, limit, sort });
+    const sort  = String(req.query.sort || "RELEVANCE");
+    const list  = await findByKeywords({ shopDomain: shop, queryText: q, limit, sort });
     res.json({
       ok:true,
       count:list.length,
       items: list.map(p => ({
-        title:p.title, handle:p.handle,
-        price: isNaN(p.price) ? null : `${p.price} ${p.currency || ""}`.trim(),
-        preview:`/products/${p.handle}`,
+        title:p.title, handle:p.handle, price:`${p.price} EUR`,
+        url: productUrl(p.handle),
         description:p.description
       }))
     });
@@ -391,11 +426,11 @@ app.get("/", (req, res) => res.send("AI Chat up ✅"));
 app.get("/test", (req, res) => {
   res.setHeader("Content-Type","text/html; charset=utf-8");
   res.end(`
-    <form action="/chat-proxy" method="GET" style="max-width:520px;margin:40px auto;font-family:sans-serif">
+    <form action="/chat-proxy" method="POST" style="max-width:520px;margin:40px auto;font-family:sans-serif">
       <h3>Test AI Chat</h3>
-      <textarea name="message" style="width:100%;height:120px"></textarea><br><br>
-      <button type="submit">Invia (GET)</button>
-      <p style="margin-top:12px;color:#666">Oppure POST /chat-proxy con body { message }.</p>
+      <textarea name="message" style="width:100%;height:120px">Mostrami il prodotto più economico</textarea><br><br>
+      <button type="submit">Invia (POST)</button>
+      <p style="margin-top:12px;color:#666">Invia anche contesto: <code>{"pageType":"product","product":{"handle":"HANDLE"}}</code></p>
     </form>
   `);
 });
